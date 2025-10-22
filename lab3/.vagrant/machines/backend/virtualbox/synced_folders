@@ -1,0 +1,1 @@
+{"virtualbox":{"/app":{"guestpath":"/app","hostpath":"D:/Dane/PWR/sem2/devops/lab3/Project-Cinema/backend","disabled":false,"__vagrantfile":true},"/vagrant":{"guestpath":"/vagrant","hostpath":"D:/Dane/PWR/sem2/devops/lab3","disabled":false,"__vagrantfile":true}}}

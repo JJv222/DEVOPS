@@ -1,0 +1,179 @@
+Vagrant.configure("2") do |config|
+  # Globalnie dla VirtualBox
+  config.vm.provider "virtualbox" do |vb|
+    vb.memory = "4096"
+    vb.cpus   = 2
+  end
+
+  config.vbguest.auto_update = false
+
+# ============================== DATABASE ==============================
+config.vm.define "database" do |db|
+  db.vm.box = "debian/bookworm64"
+  db.vm.hostname = "database"
+  db.vm.network "private_network", ip: "192.168.56.12"
+  db.vm.network "forwarded_port", guest: 5432, host: 5433
+
+  db.vm.provision "shell" do |s|
+    s.inline = <<-'SHELL'
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      apt-get update
+      apt-get install -y postgresql postgresql-contrib
+
+      PGCONF_DIR="/etc/postgresql/$(ls /etc/postgresql)/main"
+      PGC="$PGCONF_DIR/postgresql.conf"
+      PGH="$PGCONF_DIR/pg_hba.conf"
+
+      # Słuchaj na wszystkich interfejsach i bez SSL
+
+      sed -ri "s/^#?\s*listen_addresses\s*=.*/listen_addresses = '*'/" "$PGC"
+      if grep -qE '^\s*#?\s*ssl\s*=' "$PGC"; then
+        sed -ri "s/^#?\s*ssl\s*=.*/ssl = off/" "$PGC"
+      else
+        echo "ssl = off" >> "$PGC"
+      fi
+
+      # Zezwól na połączenia bez SSL (hasło SCRAM) z:
+      # - hosta po NAT (10.0.2.2/32)
+      # - sieci host-only (192.168.56.0/24)
+      # - lokalnego loopbacka
+      add_line() { grep -qF "$1" "$PGH" || echo "$1" >> "$PGH"; }
+      add_line "host  all  all  10.0.2.2/32        scram-sha-256"
+      add_line "host  all  all  192.168.56.0/24    scram-sha-256"
+      add_line "host  all  all  127.0.0.1/32       scram-sha-256"
+
+      systemctl restart postgresql
+
+      # Ustaw hasło i utwórz DB 'cinema' (jeśli brak)
+      sudo -u postgres psql -v ON_ERROR_STOP=1 -c "ALTER USER postgres WITH PASSWORD 'postgres';"
+      sudo -u postgres psql -tc "SELECT 1 FROM pg_database WHERE datname='cinema'" | grep -q 1 || sudo -u postgres createdb cinema
+
+      systemctl restart postgresql
+    SHELL
+  end
+end
+
+  # =============================== BACKEND ==============================
+  config.vm.define "backend" do |backend|
+    backend.vm.box = "debian/bookworm64"
+    backend.vm.hostname = "backend"
+    backend.vm.network "private_network", ip: "192.168.56.11"
+    backend.vm.network "forwarded_port", guest: 8080, host: 8080
+    backend.vm.synced_folder "./Project-Cinema/backend", "/app"
+
+    backend.vm.provision "shell", run: "always", inline: <<-'SHELL'
+      set -euxo pipefail
+      export DEBIAN_FRONTEND=noninteractive
+
+      # 0) SWAP 2G – stabilniejszy build
+      if ! swapon --show | grep -q .; then
+        fallocate -l 2G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=2048
+        chmod 600 /swapfile
+        mkswap /swapfile
+        swapon /swapfile
+        echo '/swapfile none swap sw 0 0' >> /etc/fstab
+      fi
+
+      # 1) narzędzia
+      apt-get update -y
+      apt-get install -y --no-install-recommends maven netcat-openbsd tar
+
+      # 2) lokalna instalacja JDK 21 z /app/jdk-21_linux-x64_bin.tar.gz
+      if [ ! -f /app/jdk-21_linux-x64_bin.tar.gz ]; then
+        echo "Brak /app/jdk-21_linux-x64_bin.tar.gz. Umieść go w ./Project-Cinema/backend/" >&2
+        ls -la /app || true
+        exit 1
+      fi
+
+      mkdir -p /opt/jdk
+      tar -xzf /app/jdk-21_linux-x64_bin.tar.gz -C /opt/jdk
+
+      J=$(find /opt/jdk -maxdepth 3 -type f -path "*/bin/java" -print -quit || true)
+      if [ -z "$J" ]; then
+        echo "Po rozpakowaniu nie znaleziono bin/java (czy to JDK dla Linux x64?)." >&2
+        exit 1
+      fi
+      JDK_ROOT="$(readlink -f "$(dirname "$J")/..")"
+      echo "Wykryty JDK_ROOT: $JDK_ROOT"
+
+      mkdir -p /usr/lib/jvm
+      ln -sfn "$JDK_ROOT" /usr/lib/jvm/jdk-21
+      update-alternatives --install /usr/bin/java  java  /usr/lib/jvm/jdk-21/bin/java  2100
+      update-alternatives --install /usr/bin/javac javac /usr/lib/jvm/jdk-21/bin/javac 2100
+      update-alternatives --install /usr/bin/jar   jar   /usr/lib/jvm/jdk-21/bin/jar   2100
+      update-alternatives --set java  /usr/lib/jvm/jdk-21/bin/java
+      update-alternatives --set javac /usr/lib/jvm/jdk-21/bin/javac
+      update-alternatives --set jar   /usr/lib/jvm/jdk-21/bin/jar
+
+      grep -q 'JAVA_HOME=/usr/lib/jvm/jdk-21' /etc/environment || echo 'JAVA_HOME=/usr/lib/jvm/jdk-21' >> /etc/environment
+      . /etc/environment
+
+      java -version
+      mvn -version
+      jar --version || true
+
+
+      # 4) build + repackage w jednym wywołaniu + start
+      cd /app
+      export MAVEN_OPTS="-Xms128m -Xmx768m -XX:+UseSerialGC"
+
+      MVN="mvn"
+      if [ -x ./mvnw ] && [ -f .mvn/wrapper/maven-wrapper.properties ]; then
+        MVN="./mvnw"
+      fi
+
+      # Jedna komenda – zapobiega "Source file is not available"
+      $MVN -B -DskipTests clean package spring-boot:repackage
+
+      # wybierz finalny JAR
+      APP_JAR="$(ls -1 target/*SNAPSHOT.jar 2>/dev/null | head -n1 || true)"
+      [ -z "$APP_JAR" ] && APP_JAR="$(ls -1 target/*.jar 2>/dev/null | head -n1 || true)"
+      if [ -z "$APP_JAR" ]; then
+        echo "Nie znaleziono JAR w target/ – build się nie powiódł." >&2
+        exit 1
+      fi
+
+      # sanity check: fat JAR (boot loader)
+      if ! jar tf "$APP_JAR" | grep -q "org/springframework/boot/loader/"; then
+        echo "Uwaga: JAR nie wygląda na fat (brak boot loadera). Aplikacja może się nie podnieść z java -jar."
+      fi
+
+      # start w tle + log
+      nohup java -jar "$APP_JAR" --server.address=0.0.0.0 >/var/log/backend.log 2>&1 &
+
+
+      echo "Backend didn't start in time. Last log lines:"
+      tail -n 200 /var/log/backend.log || true
+      exit 0
+    SHELL
+  end
+
+  # ============================== FRONTEND ==============================
+  config.vm.define "frontend" do |frontend|
+    frontend.vm.box = "debian/bookworm64"
+    frontend.vm.hostname = "frontend"
+    frontend.vm.network "private_network", ip: "192.168.56.10"
+    frontend.vm.network "forwarded_port", guest: 4300, host: 4300
+    frontend.vm.synced_folder "./Project-Cinema/frontend", "/app"
+
+    frontend.vm.provision "shell", run: "always" do |s|
+      s.inline = <<-'SHELL'
+        set -euxo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+
+        apt-get update -y
+        apt-get install -y --no-install-recommends curl netcat-openbsd
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        apt-get install -y --no-install-recommends nodejs
+        npm install -g @angular/cli@latest
+
+        chown -R vagrant:vagrant /app
+        cd /app
+        npm install
+        nohup npm run start -- --host 0.0.0.0 --port 4300 >/var/log/frontend.log 2>&1 &
+      SHELL
+    end
+  end
+end
